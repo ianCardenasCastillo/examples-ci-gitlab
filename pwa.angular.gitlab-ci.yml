@@ -1,0 +1,102 @@
+# https://purple.telstra.com/blog/run-angular-unit-tests-in-gitlab-ci
+stages:
+  - prepare
+  - test
+  - build
+  - push
+  - deploy
+
+cache:
+  paths:
+    - node_modules/
+    - www/
+
+variables:
+  # When using dind service we need to instruct docker, to talk with the
+  # daemon started inside of the service. The daemon is available with
+  # a network connection instead of the default /var/run/docker.sock socket.
+  #
+  # The 'docker' hostname is the alias of the service container as described at
+  # https://docs.gitlab.com/ee/ci/docker/using_docker_images.html#accessing-the-services
+  #
+  # If you're using GitLab Runner 12.7 or earlier with the Kubernetes executor and Kubernetes 1.6 or earlier,
+  # the variable must be set to tcp://localhost:2375 because of how the
+  # Kubernetes executor connects services to the job container
+  # DOCKER_HOST: tcp://localhost:2375
+  #
+  DOCKER_HOST: tcp://docker:2375
+  #
+  # This will instruct Docker not to start over TLS.
+  DOCKER_TLS_CERTDIR: ""
+
+dependencies:
+  image: node:latest
+  stage: prepare
+  script:
+    - npm install
+  artifacts:
+    paths:
+      - node_modules/
+
+testing:
+  image: svaseghi/node-chrome
+  before_script: 
+    - export CHROME_BIN=/usr/bin/google-chrome
+  stage: test
+  script: 
+    - npm run test:ci
+  needs: ["dependencies"]
+
+ng_build:
+  image: node:latest
+  stage: build
+  script:
+    - ./node_modules/@angular/cli/bin/ng add @angular/pwa
+    - ./node_modules/@angular/cli/bin/ng build
+  artifacts:
+    paths:
+      - www/
+  dependencies: 
+    - dependencies
+    - testing
+
+docker_build:
+  image: docker:19.03.13
+  stage: push
+  services:
+    - docker:19.03.13-dind
+  before_script:
+    - echo "$DOCKER_REGISTRY_PASSWORD" | docker login --username $DOCKER_REGISTRY_USER --password-stdin
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:latest || true
+    - docker build --cache-from $CI_REGISTRY_IMAGE:latest --tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA --tag $CI_REGISTRY_IMAGE:latest .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker push $CI_REGISTRY_IMAGE:latest
+  needs: ["ng_build"] 
+  
+deploy:
+  image: 
+    name: bitnami/kubectl:latest
+    entrypoint: [""]
+  stage: deploy
+  script:
+    - echo -n $KUBE_CONFIG_STAGING | base64 -d > ./config
+    - kubectl set image deployment $DEPLOYMENT_NAME $POD_NAME=$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA --kubeconfig ./config --namespace default
+  needs: ["docker_build"] 
+
+create_badge_svg:
+  image: python:3.6.6
+  stage: build
+  tags:
+    - docker
+  script:
+    - echo "Python other dependencies installation"
+  after_script:
+    - pip install anybadge
+    - commits=$(git rev-list --all --count)
+    - anybadge -l commits -v $commits -f commits.svg -c green
+  artifacts:
+    paths:
+      - commits.svg
+    when: always
+    expire_in: 4 weeks
